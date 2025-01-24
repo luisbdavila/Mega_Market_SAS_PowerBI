@@ -1,0 +1,485 @@
+
+/* --------------------- CHECK COHERENCE OF THE SAS EXPORTED DATASET ------------------------------------ */
+
+DATA transactional_table;
+SET work.SAS_exported;
+/* 99949 rows */
+
+
+/* exclude observations that have _SEGMENT_ = 2 (multidimensional outliers) */
+if _SEGMENT_ = '2' then do;
+delete;
+end;
+/* 97065 rows */
+
+
+/* when a purchase is made online, it's not possible to pay with physical cash */
+if (Payment = 'Cash') and (Channel ='Online') then do;
+delete;
+end;
+/* 96976 rows */
+
+
+/* verifications just to make sure (for future data) */
+if (IMP_Age<18) then do;
+delete;
+end;
+
+if (Quantity<0) then do;
+delete;
+end;
+
+if (Unit_Price<0) then do;
+delete;
+end;
+
+if (Total_payed<0) then do;
+delete;
+end;
+
+if (IMP_Kids ne 0) and (IMP_Kids ne 1) then do;
+delete;
+end;
+
+if (Gender ne 'M') and (Gender ne 'F') and (Gender ne 'O') then do;
+delete;
+end;
+
+/*if (Payment = 'Paypal') and (Channel ='Store') then do;
+delete;
+end; 
+the observations that result from this query will not be considered
+as an incongruity given being too many */
+
+
+/* correct the inconsistency associated to Total_payed column */
+if (Unit_Price*Quantity ne Total_payed) then do;
+Total_payed = Unit_Price*Quantity;
+end;
+
+
+/* drop the _SEGMENT_ and _WARN_ columns (from SAS Miner) */
+PROC SQL;
+ALTER TABLE transactional_table
+DROP _WARN_, _SEGMENT_;
+
+
+
+/* check if there are customers with different information depending on the transaction */
+PROC SQL;
+CREATE TABLE different_info AS
+SELECT CustomerNo,
+	   count(distinct IMP_Age) as n_unique_age,
+	   count(distinct Nationality) as n_unique_nationality,
+	   count(distinct Gender) as n_unique_gender,
+	   count(distinct IMP_Kids) as n_unique_kids,
+	   count(distinct IMP_Monthly_Income) as n_unique_mon_inc
+FROM transactional_table
+GROUP BY CustomerNo
+HAVING n_unique_age > 1
+	   or n_unique_nationality > 1
+	   or n_unique_gender > 1
+	   or n_unique_kids > 1
+	   or n_unique_mon_inc > 1;
+RUN;
+
+/* delete rows from transactional_table where customers have different information */
+PROC SQL;
+DELETE FROM transactional_table
+WHERE CustomerNo IN (SELECT CustomerNo FROM different_info);
+RUN;
+/* 96853 rows */
+
+
+/* export TRANSACTIONAL_TABLE (to upload in PowerBI) */
+PROC EXPORT DATA=transactional_table
+  OUTFILE='/home/u63618385/PROJECT/transactional_table.xlsx'
+  DBMS=xlsx
+  REPLACE;
+  SHEET="Transactional_Table";
+RUN;
+
+
+
+
+/* ------------------------------- BUILING ABT ------------------------------------------- */
+
+
+/* get the basics: age, gender, nationality, kids, income */
+PROC SQL;
+CREATE TABLE basics_abt AS
+SELECT CustomerNo,
+	   round(min(IMP_Age)) as Age,
+	   min(Gender) as Gender,
+	   min(Nationality) as Nationality,
+	   min(IMP_Kids) as Kids,
+	   min(imp_monthly_income) as Monthly_Income
+FROM transactional_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* number of transactions per product category (frequency) */
+PROC SQL;
+CREATE TABLE frequency_table as
+SELECT CustomerNo,  Product_Category_Name, count(distinct TransactionNo) as frequency
+FROM transactional_table
+GROUP BY CustomerNo, Product_Category_Name;
+RUN;
+/* lets sort... */
+PROC SORT DATA=frequency_table;
+	BY CustomerNo;
+RUN;
+/* ...and transpose the table */
+PROC TRANSPOSE DATA=frequency_table
+	OUT=frequency_abt
+	PREFIX=Freq_;
+	ID Product_Category_Name;
+	BY CustomerNo;
+RUN;
+
+
+/* amount spent per product category (monetary) */
+PROC SQL;
+CREATE TABLE monetary_table as
+SELECT CustomerNo, Product_Category_Name, sum(Total_payed) as monetary
+FROM transactional_table
+GROUP BY CustomerNo, Product_Category_Name;
+run;
+/* lets sort... */
+PROC SORT DATA=monetary_table;
+	BY CustomerNo;
+RUN;
+/* ...and transpose the table */
+PROC TRANSPOSE DATA=monetary_table
+	OUT=monetary_abt
+    PREFIX=Mon_;
+	ID Product_Category_Name;
+	BY CustomerNo;
+RUN;
+
+
+/* merge into one single table */
+DATA abt_1;
+	MERGE basics_abt frequency_abt monetary_abt;
+	BY CustomerNo;
+	DROP _NAME_;
+RUN;
+
+
+/* fill the missing values as 0 (not actually missing) */
+DATA abt_2;
+SET abt_1;
+ARRAY change _numeric_;
+	DO OVER change;
+		IF change=. THEN change=0;
+	END;
+RUN;
+
+
+/* date of the first and last transactions */
+PROC SQL;
+CREATE TABLE first_last_dates AS
+SELECT distinct CustomerNo,
+	   min(Date) as Date_First_Purchase,
+	   max(Date) as Date_Last_Purchase
+FROM transactional_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* days since first and last transactions */
+DATA days_since;
+SET first_last_dates;
+/* 21914 is the number of days between 1 JAN 1960 to 31 DEC 2019 */
+Time_Since_First_Purchase = 21914 - Date_First_Purchase;
+Time_Since_Last_Purchase = 21914 - Date_Last_Purchase;
+RUN;
+
+
+/* format both 'Date_First_Purchase' and 'Date_Last_Purchase' */
+DATA dates_abt;
+SET days_since;
+FORMAT Date_First_Purchase date9.;
+FORMAT Date_Last_Purchase date9.;
+RUN;
+
+
+/* merge again into one single table */
+DATA abt_3;
+	MERGE abt_2 dates_abt ;
+	BY CustomerNo;
+RUN;
+
+
+/* favourite weekday to shop */
+/* 1) get the weekdays from the dates and number of transactions per weekday (there is no mode function) */
+PROC SQL;
+CREATE TABLE weekday_freq_table AS
+SELECT CustomerNo,
+	   put(Date, dowName.) as weekday,
+	   count(distinct(TransactionNo)) as weekday_freq
+FROM transactional_table
+GROUP BY CustomerNo, weekday;
+RUN;
+/* 2) get the most frequent weekday for each customer */
+PROC SQL;
+CREATE TABLE weekday_most_freq AS
+SELECT CustomerNo, weekday as most_freq_weekday
+FROM weekday_freq_table
+GROUP BY CustomerNo
+HAVING weekday_freq = max(weekday_freq);
+RUN;
+/* 3) check if there are equally frequent 'most_freq_weekday' for each customer */
+PROC SQL;
+CREATE TABLE weekday_equal_freq AS
+SELECT CustomerNo,
+	   most_freq_weekday as Favourite_Weekday,
+	   count(most_freq_weekday) as nr_weekday_equal_freq
+FROM weekday_most_freq
+GROUP BY CustomerNo;
+RUN;
+/* 4) if there are, then those customers won't have a favourite weekday to shop */
+DATA weekday_fav_table;
+SET weekday_equal_freq;
+if (nr_weekday_equal_freq = 1) then Favourite_Weekday = Favourite_Weekday;
+if (nr_weekday_equal_freq > 1) then Favourite_Weekday = 'NoneExistent';
+RUN;
+/* 5) finally get the favourite weekday for each customer */
+PROC SQL;
+CREATE TABLE weekday_fav_abt AS
+SELECT distinct(CustomerNo), Favourite_Weekday
+FROM weekday_fav_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* favourite month to shop */
+/* 1) get the months from the dates and number of transactions per month (there is no mode function) */
+PROC SQL;
+CREATE TABLE month_freq_table AS
+SELECT CustomerNo,
+	   put(Date, monname3.) as month,
+	   count(distinct(TransactionNo)) as month_freq
+FROM transactional_table
+GROUP BY CustomerNo, month;
+RUN;
+/* 2) get the most frequent month for each customer */
+PROC SQL;
+CREATE TABLE month_most_freq AS
+SELECT CustomerNo, month as most_freq_month
+FROM month_freq_table
+GROUP BY CustomerNo
+HAVING month_freq = max(month_freq);
+RUN;
+/* 3) check if there are equally frequent 'most_freq_month' for each customer */
+PROC SQL;
+CREATE TABLE month_equal_freq AS
+SELECT CustomerNo,
+	   most_freq_month as Favourite_Month,
+	   count(most_freq_month) as nr_month_equal_freq
+FROM month_most_freq
+GROUP BY CustomerNo;
+RUN;
+/* 4) if there are, then those customers won't have a favourite month to shop */
+DATA month_fav_table;
+SET month_equal_freq;
+if (nr_month_equal_freq = 1) then Favourite_Month = Favourite_Month;
+if (nr_month_equal_freq > 1) then Favourite_Month = 'NoneExistent';
+RUN;
+/* 5) finally get the favourite month for each customer */
+PROC SQL;
+CREATE TABLE month_fav_abt AS
+SELECT distinct(CustomerNo), Favourite_Month
+FROM month_fav_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* merge again into one single table */
+DATA abt_4;
+	MERGE abt_3 weekday_fav_abt month_fav_abt;
+	BY CustomerNo;
+RUN;
+
+
+/* total number of transactions */
+PROC SQL;
+CREATE TABLE total_purchases_abt AS
+SELECT CustomerNo, count(distinct TransactionNo) as Total_Nr_Purchases
+FROM transactional_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* proportion of transactions by payment method */
+PROC SQL;
+CREATE TABLE payment_pct_table AS
+SELECT t1.CustomerNo,
+	   t1.Payment,
+	   count(distinct t1.TransactionNo)*100/(SELECT count(distinct t2.TransactionNo)
+	   									 	 FROM transactional_table t2
+	   									 	 WHERE t1.CustomerNo = t2.CustomerNo) as payment_pct 
+FROM transactional_table t1
+GROUP BY CustomerNo, Payment;
+RUN;
+/* lets sort... */
+PROC SORT DATA=payment_pct_table;
+	BY CustomerNo;
+RUN;
+/* ...and transpose the table */
+PROC TRANSPOSE DATA=payment_pct_table
+	OUT=payment_pct_abt
+	PREFIX=Pct_;
+	ID Payment;
+	BY CustomerNo;
+RUN;
+
+
+/* proportion of transactions by channel */
+PROC SQL;
+CREATE TABLE channel_pct_table AS
+SELECT t1.CustomerNo,
+	   t1.Channel,
+	   count(distinct t1.TransactionNo)*100/(SELECT count(distinct t2.TransactionNo)
+	   									 	 FROM transactional_table t2
+	   									 	 WHERE t1.CustomerNo = t2.CustomerNo) as channel_pct
+FROM transactional_table t1
+GROUP BY CustomerNo, Channel;
+RUN;
+/* lets sort... */
+PROC SORT DATA=channel_pct_table;
+	BY CustomerNo;
+RUN;
+/* ...and transpose the table */
+PROC TRANSPOSE DATA=channel_pct_table
+	OUT=channel_pct_abt
+	PREFIX=Pct_;
+	ID Channel;
+	BY CustomerNo;
+RUN;
+
+
+/* merge again into one single table */
+DATA abt_5;
+	MERGE abt_4 total_purchases_abt payment_pct_abt channel_pct_abt;
+	BY CustomerNo;
+	DROP _NAME_;
+RUN;
+
+
+/* fill the missing values as 0 (they are not actually missing) */
+DATA abt_6;
+SET abt_5;
+ARRAY change _numeric_;
+	DO OVER change;
+		IF change=. THEN change=0;
+	END;
+RUN;
+
+
+/* total amount spent */
+PROC SQL;
+CREATE TABLE amt_spent_abt AS
+SELECT CustomerNo, sum(Total_payed) as Total_Amt_Spent
+FROM transactional_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* largest transaction (highest amount spent) */
+PROC SQL;
+CREATE TABLE largest_amt_abt AS
+SELECT CustomerNo, max(Total_payed) as Largest_Amt_Spent
+FROM transactional_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* merge again into one single table */
+DATA abt_7;
+	MERGE abt_6 amt_spent_abt largest_amt_abt;
+	BY CustomerNo;
+RUN;
+
+
+/* average amount spent */
+PROC SQL;
+CREATE TABLE avg_amt_abt AS
+SELECT CustomerNo, Total_Amt_Spent/Total_Nr_Purchases as Avg_Amt_Spent
+FROM abt_7
+RUN;
+
+
+/* smallest transaction (smallest amount spent)  */
+PROC SQL;
+CREATE TABLE smallest_amt_abt AS
+SELECT CustomerNo, min(Total_payed) as Smallest_Amt_Spent
+FROM transactional_table
+GROUP BY CustomerNo;
+RUN;
+
+
+/* merge again into one single table */
+DATA abt_8;
+	MERGE abt_7 avg_amt_abt smallest_amt_abt;
+	BY CustomerNo;
+RUN;
+
+
+/* proportion of the customer’s monthly income spent on the Mega Market */
+PROC SQL;
+CREATE TABLE rate_income_abt AS
+SELECT CustomerNo, Monthly_Income, Total_Amt_Spent, (Total_Amt_Spent*100/Monthly_Income) as Rate_of_Income
+FROM abt_8
+GROUP BY CustomerNo;
+RUN;
+
+
+/* merge again into one single table */
+DATA abt_9;
+	MERGE abt_8 rate_income_abt;
+	BY CustomerNo;
+RUN;
+
+
+/* divide customers into categories (gold, silver, bronze) */
+/* step 1) compute quartiles to know limits to define for customer avg amount spent */
+PROC UNIVARIATE DATA=abt_8;
+    VAR Avg_Amt_Spent;
+    OUTPUT OUT=quartiles_Avg_Amt_Spent
+    PCTLPTS = 25 50 75
+    PCTLPRE = Q_;
+RUN;
+/* step 2) divide into groups */
+PROC SQL;
+CREATE TABLE categories_abt AS
+SELECT CustomerNo, CASE
+                WHEN Avg_Amt_Spent > 436  THEN 'Gold'
+                WHEN Avg_Amt_Spent > 231  and Avg_Amt_Spent < 436 THEN 'Silver'
+                ELSE 'Bronze'
+                END AS Category
+FROM abt_8;
+RUN;
+/* step 3) check number of customers in each category */
+PROC SQL;
+SELECT Category, count(*)
+FROM categories_abt
+GROUP BY Category;
+RUN;
+
+/* merge again to crate final ABT */
+DATA abt_final;
+	MERGE abt_9 categories_abt;
+	BY CustomerNo;
+RUN;
+
+
+/* export ABT_FINAL */
+PROC EXPORT DATA=abt_final
+  OUTFILE='/home/u63618385/PROJECT/abt_final.xlsx'
+  DBMS=xlsx
+  REPLACE;
+  SHEET="abt_final";
+RUN;
+
